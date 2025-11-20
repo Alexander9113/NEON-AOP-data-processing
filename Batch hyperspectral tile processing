@@ -1,0 +1,240 @@
+## ---------------------------
+##
+## Script name: Batch process NEON AOP hyperspectral files 
+##
+## Purpose of script: This script will process a batch of NEON hyperspectral
+##                    files. It will also create an NDVI and shade mask that can
+##                    be applied to all processed tiles. 
+##      
+##
+## Author: Alexander Cox
+##
+## Email: acox22@nd.edu
+## ----------------------------
+
+#clear environment 
+rm(list=ls())
+
+
+# ------------------------------------------------------------------------------
+# 1. Install and load required packages 
+# ------------------------------------------------------------------------------
+
+
+#install required packages 
+list.of.packages <- c("BiocManager", "dplyr", "neonUtilities", "sf", "terra", 
+                      "tidyr")
+
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+#install rhdf5 from Bioconductor to work with the file type 
+BiocManager::install("rhdf5")
+
+#load required packages  
+library(dplyr)
+library(neonUtilities)
+library(rhdf5)
+library(sf)
+library(terra)
+library(tidyr)
+
+
+# ------------------------------------------------------------------------------
+# 2. Define the hyperspectral, DSM, and output folders
+# ------------------------------------------------------------------------------
+
+
+#path to the unprocessed hyperspectral files 
+refl_folder <- "F:/UNDE_2022-unprocessed-refl-tiles/NEON_refl-surf-bidir-ortho-mosaic/script.test"
+
+#path to the digital surface model (DSM) files  
+dsm_folder <- "S:/Neon data/UNDE 2022/UNDE-DSM-files/NEON_lidar-elev/script.test"
+
+#path to store the processed files  
+out_folder <- "S:/Neon data/processed.tiles.test"
+
+#gather file lists 
+refl_files <- list.files(
+  path = refl_folder, 
+  pattern = "\\.h5$",  # NEON reflectance files
+  recursive = TRUE,    
+  full.names = TRUE
+)
+
+dsm_files <- list.files(
+  path = dsm_folder, 
+  pattern = "\\_DSM.tif$", # DSM .tif files
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+
+# ------------------------------------------------------------------------------
+# 3. Define a function to grab the solar angles from the .h5 files 
+# ------------------------------------------------------------------------------
+
+getSolarAngles <- function(h5file) {
+  h5info <- h5ls(h5file, recursive=TRUE)
+  
+  #build a full path from group + name
+  h5info$fullpath <- file.path(h5info$group, h5info$name)
+  
+  #locate azimuth/zenith by searching fullpath
+  az_idx <- grep("Solar_Azimuth_Angle", h5info$fullpath)
+  zn_idx <- grep("Solar_Zenith_Angle",  h5info$fullpath)
+  
+  if (length(az_idx) == 0 || length(zn_idx) == 0) {
+    message("No solar angles found in: ", h5file)
+    return(NULL)
+  }
+  
+  az_path <- h5info$fullpath[az_idx[1]]
+  zn_path <- h5info$fullpath[zn_idx[1]]
+  
+  solar_az <- h5read(h5file, az_path)
+  solar_zn <- h5read(h5file, zn_path)
+  
+  list(azimuth = solar_az, zenith = solar_zn)
+}
+
+
+# ------------------------------------------------------------------------------
+# 4. Define a function to create reflectance stacks
+# ------------------------------------------------------------------------------
+
+
+readReflectanceStack <- function(h5file) {
+  #read in meta data 
+  reflInfo <- h5readAttributes(h5file, "/UNDE/Reflectance/Reflectance_Data")
+  h5NoDataValue <- as.integer(reflInfo$Data_Ignore_Value)
+  scaleFactor   <- as.integer(reflInfo$Scale_Factor)
+  
+  #set the spatial extent 
+  xyExt <- reflInfo$Spatial_Extent_meters
+  xMin <- xyExt[1]; xMax <- xyExt[2]
+  yMin <- xyExt[3]; yMax <- xyExt[4]
+  full_ext <- ext(xMin, xMax, yMin, yMax)
+  
+  #read in the wavelenght data 
+  wavelengths <- h5read(h5file, "/UNDE/Reflectance/Metadata/Spectral_Data/Wavelength")
+  band_count  <- length(wavelengths)
+  rounded_wv  <- round(wavelengths)
+  
+  #create a list of raster layers 
+  all_rasters <- vector("list", band_count)
+  
+  #extract the bands 
+  for (b in seq_len(band_count)) {
+    arr <- h5read(h5file, "/UNDE/Reflectance/Reflectance_Data",
+                  index = list(b, NULL, NULL))
+    arr <- arr[1, , ]
+    arr <- t(arr)
+    arr[arr == h5NoDataValue] <- NA
+    r <- rast(arr, extent = full_ext)
+    all_rasters[[b]] <- r
+  }
+  
+  #combine into a multiband raster 
+  reflectance <- rast(all_rasters)
+  
+  #assign the coordinate reference system 
+  crs(reflectance) <- "EPSG:32616"
+  
+  #apply scale factor
+  reflectance <- reflectance / scaleFactor
+  
+  #name each layer by approximate wavelength
+  names(reflectance) <- paste0("Wv.", rounded_wv)
+  
+  reflectance
+}
+
+
+# ------------------------------------------------------------------------------
+# 4. Define a function to generate the shade mask. Defined as 0-1.0 (0 to 100% 
+#    illumination)
+# ------------------------------------------------------------------------------
+
+
+makeShadeMask <- function(dsm, solar_az_deg, solar_zn_deg, threshold = 0.8) {
+  #calculate slope and aspect in degrees 
+  dsm_slope_deg  <- terrain(dsm, v = "slope",  unit="degrees")
+  dsm_aspect_deg <- terrain(dsm, v = "aspect", unit="degrees")
+  
+  #calculate shade 
+  s <- shade(
+    slope     = dsm_slope_deg,
+    aspect    = dsm_aspect_deg,
+    angle     = solar_zn_deg,  # degrees
+    direction = solar_az_deg,  # degrees
+    normalize = TRUE
+  )
+  #set the threshold 
+  s[s < threshold] <- NA
+  return(s)
+}
+
+
+# ------------------------------------------------------------------------------
+# 5. Loop through each reflectance tile, apply the shade and NDVI masks
+# ------------------------------------------------------------------------------
+
+
+for (h5 in refl_files) {
+  #grab the .h5 file name 
+  tile_id <- gsub("_bidirectional_reflectance\\.h5$", "", basename(h5))
+  cat("Processing tile:", tile_id, "\n")
+  
+  #match to the corresponding DSM file, if available 
+  match_dsm <- dsm_files[grepl(tile_id, dsm_files)]
+  if (length(match_dsm) == 0) {
+    cat("No matching DSM found for", tile_id, "\n\n")
+    next
+  } else if (length(match_dsm) > 1) {
+    cat("Multiple DSM matches found, using first.\n")
+    match_dsm <- match_dsm[1]
+  }
+  
+  #read the DSM file, set CRS to match .h5 file 
+  dsm <- rast(match_dsm)
+  crs(dsm) <- "EPSG:32616"
+  
+  #grab the solar angles 
+  angles <- getSolarAngles(h5)
+  if (is.null(angles)) {
+    cat("Skipping shade mask for tile with no angles.\n\n")
+    next
+  }
+  
+  solar_az_deg <- angles$azimuth
+  solar_zn_deg <- angles$zenith
+  
+  #create the shade mask 
+  shade_mask <- makeShadeMask(dsm, solar_az_deg, solar_zn_deg, threshold = 0.8)
+  
+  #read in the reflectance stack 
+  reflectance <- readReflectanceStack(h5)
+  
+  #make sure the resolution and extents match, resample if needed 
+  if (!compareGeom(reflectance, shade_mask, stopOnError = FALSE)) {
+    shade_mask <- resample(shade_mask, reflectance, method="near")
+  }
+  
+  #set shade masked pixels to NA 
+  reflectance[is.na(shade_mask)] <- NA
+  
+  #calculate NDVI from the bands in NEON's tutorial, apply a 0.8 threshold, 
+  #setting pixel values < 0.8 to NA 
+  red_band <- reflectance[[58]]  # ~667 nm
+  nir_band <- reflectance[[90]]  # ~827 nm
+  ndvi <- (nir_band - red_band) / (nir_band + red_band)
+  reflectance[ndvi < 0.8] <- NA
+  
+  
+  #write the final masked reflectance stack
+  out_file <- file.path(out_folder, paste0(tile_id, "_masked.tif"))
+  writeRaster(reflectance, out_file, overwrite=TRUE)
+  
+  cat("Masked reflectance saved to:", out_file, "\n\n")
+}
